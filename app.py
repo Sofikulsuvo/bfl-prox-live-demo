@@ -3,6 +3,7 @@ import os
 import base64
 import hashlib
 import time
+import urllib.request
 import numpy as np
 import pandas as pd
 import torch
@@ -119,9 +120,13 @@ def pin_to_offchain_ipfs(state_dict):
 def init_embedded_evm():
     solc_dir = "/tmp/solcx"
     os.makedirs(solc_dir, exist_ok=True)
-    installed = [str(v) for v in solcx.get_installed_solc_versions(solcx_binary_path=solc_dir)]
-    if "0.8.20" not in installed:
-        solcx.install_solc("0.8.20", solcx_binary_path=solc_dir)
+    solc_bin = os.path.join(solc_dir, "solc-v0.8.20")
+
+    if not os.path.exists(solc_bin):
+        url = "https://raw.githubusercontent.com/ethereum/solc-bin/gh-pages/linux-amd64/solc-linux-amd64-v0.8.20%2Bcommit.a1b79de6"
+        urllib.request.urlretrieve(url, solc_bin)
+        os.chmod(solc_bin, 0o755)
+
     solcx.set_solc_version("0.8.20", solcx_binary_path=solc_dir)
 
     compiled = solcx.compile_source(
@@ -316,99 +321,4 @@ def run_live_round(phone3_mode, mu=0.05):
             "IPFS_CID": cid[:22] + "...",
             "Cosine": round(cos_sim, 4),
             "Norm_Ratio": round(norm_ratio, 2),
-            "Weight_Alpha": round(alpha, 2),
-            "OnChain_Rep": new_rep
-        })
-
-    tot_alpha = sum(weights_alpha)
-    if tot_alpha > 0:
-        new_global_sd = {
-            k: sum((weights_alpha[i] / tot_alpha) * clipped_sds[i][k] for i in range(len(clipped_sds)))
-            for k in global_sd
-        }
-        global_model.load_state_dict(new_global_sd)
-
-    global_model.eval()
-    with torch.no_grad():
-        preds = torch.argmax(global_model(X_test_t), dim=1).numpy()
-        macro_f1 = float(f1_score(y_test_np, preds, average="macro"))
-        acc = float(accuracy_score(y_test_np, preds) * 100.0)
-
-    g_cid, g_kb, g_stored_sd = pin_to_offchain_ipfs(global_model.state_dict())
-    st.session_state.ipfs_store[g_cid] = g_stored_sd
-    commit_tx = contract.functions.commitGlobalModel(g_cid).transact({"from": committee_addr})
-    commit_rcpt = w3.eth.wait_for_transaction_receipt(commit_tx)
-
-    st.session_state.chain_txs.append({
-        "Block": commit_rcpt.blockNumber,
-        "Event": f"GlobalModelCommitted (R{onchain_round})",
-        "Sender": committee_addr[:10] + "...",
-        "IPFS_CID": g_cid[:22] + "...",
-        "Payload_KB": g_kb,
-        "Tx_Hash": commit_rcpt.transactionHash.hex()[:18] + "...",
-        "Gas_Used": commit_rcpt.gasUsed
-    })
-    st.session_state.f1_history.append({"Round": onchain_round, "Macro_F1": macro_f1, "Accuracy_%": acc})
-
-# ==========================================================
-# 6. STREAMLIT LIVE CLOUD UI
-# ==========================================================
-st.title("BFL-Prox: Live Online 3-Phone Blockchain-FL Simulator")
-st.caption(f"Live Solidity Contract `{contract.address}` (EVM) + Off-Chain IPFS CIDv1 + `LightweightMalwareMLP` (602.02 KB)")
-
-with st.sidebar:
-    st.header("Simulation Controls")
-    p3_mode = st.selectbox(
-        "Phone 3 Behavior Mode:",
-        ["Honest (Normal FedProx)", "Sign-Flipping (-2x Update)", "Label-Flipping (Malware -> Benign)"]
-    )
-    if st.button("Execute Live Round (IPFS + EVM)", type="primary", use_container_width=True):
-        run_live_round(p3_mode)
-    if st.button("Execute 3 Consecutive Rounds", use_container_width=True):
-        for _ in range(3):
-            run_live_round(p3_mode)
-
-cols = st.columns(3)
-for idx, (name, _) in enumerate(phones_data):
-    addr = phone_addrs[idx]
-    rep = contract.functions.getReputation(addr).call()
-    status = "ACTIVE" if rep >= 30 else "QUARANTINED (R < 30)"
-    with cols[idx]:
-        st.subheader(name.split(" (")[0])
-        st.caption(f"Wallet: `{addr[:14]}...`")
-        st.metric("On-Chain Reputation (R)", f"{rep} / 100", status)
-        st.progress(rep / 100.0)
-
-st.divider()
-left_col, right_col = st.columns([1, 1.3])
-
-with left_col:
-    st.subheader("On-Device Real-Time APK Scanner")
-    sample_idx = st.slider("Test APK Sample Index", 0, len(X_test_t) - 1, 0)
-    sample_x = X_test_t[sample_idx : sample_idx + 1]
-    true_label = CLASS_NAMES[int(y_test_np[sample_idx])]
-
-    st.session_state.global_model.eval()
-    with torch.no_grad():
-        t0 = time.perf_counter()
-        probs = torch.softmax(st.session_state.global_model(sample_x), dim=1).numpy()[0]
-        lat_ms = (time.perf_counter() - t0) * 1000.0
-
-    pred_label = CLASS_NAMES[int(np.argmax(probs))]
-    st.write(f"**True:** `{true_label}` | **Predicted:** `{pred_label}` | **Latency:** `{lat_ms:.3f} ms`")
-    st.bar_chart(pd.DataFrame({"Category": CLASS_NAMES, "Confidence": probs}).set_index("Category"))
-
-with right_col:
-    st.subheader("Global Model Macro-F1 Progression")
-    if st.session_state.f1_history:
-        st.line_chart(pd.DataFrame(st.session_state.f1_history).set_index("Round")["Macro_F1"])
-    else:
-        st.info("Click 'Execute Live Round (IPFS + EVM)' in the sidebar to begin.")
-
-st.divider()
-st.subheader("Validator Committee Cosine & Reputation Audit")
-if st.session_state.audit_logs:
-    st.dataframe(pd.DataFrame(st.session_state.audit_logs).iloc[::-1], use_container_width=True, hide_index=True)
-
-st.subheader("Live EVM Smart Contract Transaction & IPFS CID Explorer")
-st.dataframe(pd.DataFrame(st.session_state.chain_txs).iloc[::-1], use_container_width=True, hide_index=True)
+            "Weight
